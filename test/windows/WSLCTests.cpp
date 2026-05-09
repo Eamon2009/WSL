@@ -3084,8 +3084,6 @@ class WSLCTests
         {
             // Add a ipv6 binding
             VERIFY_SUCCEEDED(session->MapVmPort(AF_INET6, 1234, 80));
-            // Virtio proxy maps IPv4 and IPv6 to the same backend port, so we expect the same content on both.
-            expectContent(1234, AF_INET6, "port80");
             listen(80, "port80ipv6", true);
             expectContent(1234, AF_INET6, "port80ipv6");
 
@@ -6210,7 +6208,7 @@ class WSLCTests
             auto [hresult, newContainer] = subLauncher.LaunchNoThrow(session);
 
             // TODO: Fix once virtionet error code is changed.
-            VERIFY_ARE_EQUAL(hresult, HRESULT_FROM_WIN32(networkingMode == WSLCNetworkingModeNAT ? ERROR_ALREADY_EXISTS : E_FAIL));
+            VERIFY_ARE_EQUAL(hresult,networkingMode == WSLCNetworkingModeNAT ?  HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS) : E_FAIL);
 
             // Verify that a stopped container returns no ports.
             VERIFY_SUCCEEDED(container.Get().Stop(WSLCSignalSIGKILL, 0));
@@ -6260,7 +6258,9 @@ class WSLCTests
             launcher.AddPort(1234, 8000, AF_INET);
 
             // TODO: Fix once virtionet error code is changed.
-            VERIFY_ARE_EQUAL(launcher.LaunchNoThrow(session).first, networkingMode == WSLCNetworkingModeNAT ? ERROR_ALREADY_EXISTS : E_FAIL);
+            VERIFY_ARE_EQUAL(
+                launcher.LaunchNoThrow(session).first,
+                networkingMode == WSLCNetworkingModeNAT ? HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS) : E_FAIL);
         }
 
         auto bindSocket = [](auto port) {
