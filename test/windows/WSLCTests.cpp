@@ -6385,7 +6385,7 @@ class WSLCTests
 
         // Disabled because the same host port can't be bound in both ipv4 & ipv6 by virtionet.
         // TODO: Enabled once fixed
-        //RunPortMappingsTest(*session, WSLCContainerNetworkTypeHost, WSLCNetworkingModeVirtioProxy);
+        // RunPortMappingsTest(*session, WSLCContainerNetworkTypeHost, WSLCNetworkingModeVirtioProxy);
     }
 
     WSLC_TEST_METHOD(PortMappingsAdvanced)

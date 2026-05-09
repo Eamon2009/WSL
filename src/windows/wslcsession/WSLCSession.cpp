@@ -2489,7 +2489,6 @@ try
     mapping.AssignVmPort(it->second.first);
 
     m_virtualMachine->MapPort(mapping);
-   
 
     // Increase usage count.
     it->second.second++;
