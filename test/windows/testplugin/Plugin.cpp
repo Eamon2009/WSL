@@ -15,6 +15,9 @@ Abstract:
 #include "precomp.h"
 #include "WslPluginApi.h"
 
+#include <atomic>
+#include <future>
+
 #include "PluginTests.h"
 
 using namespace wsl::windows::common::registry;
@@ -26,6 +29,48 @@ const WSLPluginAPIV1* g_api = nullptr;
 PluginTestType g_testType = PluginTestType::Invalid;
 
 std::optional<uint32_t> g_previousInitPid;
+
+// Serializes writes to g_logfile from multiple threads in modes that spawn
+// worker threads (ConcurrentApiCalls, AsyncApiCall, CallbackDuringTermination).
+// Hook-thread writes that don't overlap with worker writes don't need to take
+// this — but it's harmless to do so.
+std::mutex g_logMutex;
+
+void LogLine(const std::string& line)
+{
+    std::lock_guard guard{g_logMutex};
+    g_logfile << line << std::endl;
+}
+
+// State for AsyncApiCall: worker thread launched in OnDistroStarted, joined
+// in OnDistroStopping. The promise carries the result so the hook can log it
+// after the join. The future is retrieved exactly once (in OnDistroStarted)
+// and consumed in OnDistroStopping — std::promise::get_future() can only be
+// called once per promise instance.
+std::optional<std::thread> g_asyncWorker;
+std::optional<std::promise<HRESULT>> g_asyncWorkerResult;
+std::future<HRESULT> g_asyncWorkerFuture;
+std::string g_asyncWorkerOutput;
+
+// State for CallbackDuringTermination: detached workers exit when they observe
+// a failure AFTER OnVmStopping has set g_drainStopAfterFailure. Using an
+// explicit signal (rather than counting consecutive failures) avoids the
+// possibility of a worker "reviving" if a subsequent StartWsl creates a new
+// VM with the same session/distro IDs before the worker has accumulated
+// enough failures to self-terminate. The signal is set inside the OnVmStopping
+// hook, which fires BEFORE _VmTerminate's exclusive-lock drain (see
+// LxssUserSession::_VmTerminate), so workers still race the drain — they just
+// stop deterministically once it completes and m_utilityVm.reset() makes
+// further calls fail.
+//
+// g_drainWorkersStarted prevents a second OnDistroStarted (triggered by the
+// post-shutdown StartWsl the test uses to verify the service survived) from
+// spawning a fresh batch of workers and leaking them past the end of the
+// test — workers spawn at most once per test execution.
+std::atomic<int> g_drainSuccess{0};
+std::atomic<int> g_drainFailures{0};
+std::atomic<bool> g_drainStopAfterFailure{false};
+std::atomic<bool> g_drainWorkersStarted{false};
 
 std::vector<char> ReadFromSocket(SOCKET socket)
 {
@@ -178,12 +223,108 @@ HRESULT OnVmStarted(const WSLSessionInformation* Session, const WSLVmCreationSet
 
         return S_OK;
     }
+    else if (g_testType == PluginTestType::HostCrash)
+    {
+        // Validate plugin host crash isolation. Forcefully exit the host
+        // process so the COM RPC returns one of the HRESULTs in IsHostCrash
+        // (RPC_E_DISCONNECTED / RPC_E_SERVER_DIED / ...). The service should
+        // treat this as non-fatal and continue.
+        LogLine("Crashing host");
+        g_logfile.flush();
+        TerminateProcess(GetCurrentProcess(), 1);
+        // Unreachable.
+        return E_UNEXPECTED;
+    }
+    else if (g_testType == PluginTestType::ConcurrentApiCalls)
+    {
+        // Validate concurrent service-side callbacks under the new
+        // m_callbackLock (shared_mutex). N threads call MountFolder +
+        // ExecuteBinary in parallel via a start-gate so the shared_lock has
+        // multiple readers in flight at once.
+        constexpr int N = 4;
+
+        std::filesystem::path modulePath = wil::GetModuleFileNameW(wil::GetModuleInstanceHandle()).get();
+        const auto mountSource = modulePath.parent_path().wstring();
+
+        std::mutex gateMutex;
+        std::condition_variable gateCv;
+        int arrived = 0;
+        bool released = false;
+
+        std::atomic<int> successes{0};
+        std::atomic<int> failures{0};
+
+        const auto worker = [&](int index) {
+            // Wait for all workers to reach the gate so the API calls overlap.
+            {
+                std::unique_lock lock{gateMutex};
+                ++arrived;
+                if (arrived == N)
+                {
+                    released = true;
+                    gateCv.notify_all();
+                }
+                else
+                {
+                    gateCv.wait(lock, [&]() { return released; });
+                }
+            }
+
+            const auto linuxPath = L"/test-plugin/concurrent-" + std::to_wstring(index);
+            const auto mountName = L"test-plugin-concurrent-" + std::to_wstring(index);
+            HRESULT hr = g_api->MountFolder(Session->SessionId, mountSource.c_str(), linuxPath.c_str(), true, mountName.c_str());
+            if (FAILED(hr))
+            {
+                ++failures;
+                return;
+            }
+
+            wil::unique_socket socket;
+            std::vector<const char*> args = {"/bin/true", nullptr};
+            hr = g_api->ExecuteBinary(Session->SessionId, args[0], args.data(), &socket);
+            if (FAILED(hr))
+            {
+                ++failures;
+                return;
+            }
+
+            ++successes;
+        };
+
+        std::vector<std::thread> threads;
+        threads.reserve(N);
+        for (int i = 0; i < N; ++i)
+        {
+            threads.emplace_back(worker, i);
+        }
+        for (auto& t : threads)
+        {
+            t.join();
+        }
+
+        LogLine(
+            "Concurrent callbacks complete: success=" + std::to_string(successes.load()) + " failures=" + std::to_string(failures.load()));
+
+        if (failures.load() != 0)
+        {
+            return E_FAIL;
+        }
+    }
 
     return S_OK;
 }
 
 HRESULT OnVmStopping(const WSLSessionInformation* Session)
 {
+    if (g_testType == PluginTestType::CallbackDuringTermination)
+    {
+        // Signal detached drain workers to exit on their next failure. Fires
+        // before _VmTerminate's exclusive m_callbackLock acquire, so workers
+        // still race the drain — they just stop deterministically once
+        // m_utilityVm.reset() starts failing subsequent calls.
+        g_drainStopAfterFailure = true;
+    }
+
     g_logfile << "VM Stopping" << std::endl;
 
     if (g_testType == PluginTestType::FailToStopVm)
@@ -279,16 +420,160 @@ HRESULT OnDistroStarted(const WSLSessionInformation* Session, const WSLDistribut
         g_logfile << "Invalid distro launch returned:  "
                   << g_api->ExecuteBinaryInDistribution(Session->SessionId, &guid, arguments[0], arguments.data(), &socket) << std::endl;
     }
+    else if (g_testType == PluginTestType::AsyncApiCall)
+    {
+        // Validate plugin API calls from a worker thread that outlives the
+        // hook. The worker thread is joined in OnDistroStopping — joining is
+        // unconditional (no timeout) because letting the worker outlive
+        // g_pluginHost (cleared in ~PluginHost) would dereference freed memory.
+        g_asyncWorkerOutput.clear();
+        g_asyncWorkerResult.emplace();
+        g_asyncWorkerFuture = g_asyncWorkerResult->get_future();
+
+        const DWORD sessionId = Session->SessionId;
+        const GUID distroId = Distribution->Id;
+
+        g_asyncWorker.emplace([sessionId, distroId]() {
+            // Sleep briefly so the call is guaranteed to happen after the
+            // hook has returned — exercises the cross-apartment callback
+            // path from a non-hook thread that hasn't called CoInitializeEx.
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+            wil::unique_socket socket;
+            std::vector<const char*> args = {"/bin/echo", "hello-from-worker", nullptr};
+            const HRESULT hr = g_api->ExecuteBinaryInDistribution(sessionId, &distroId, args[0], args.data(), &socket);
+
+            if (SUCCEEDED(hr))
+            {
+                const auto output = ReadFromSocket(socket.get());
+                std::string captured(output.begin(), output.end());
+                // Strip trailing newline added by /bin/echo so the log line
+                // doesn't get split when ValidateLogFile splits on '\n'.
+                while (!captured.empty() && (captured.back() == '\n' || captured.back() == '\r'))
+                {
+                    captured.pop_back();
+                }
+                std::lock_guard guard{g_logMutex};
+                g_asyncWorkerOutput = std::move(captured);
+            }
+
+            g_asyncWorkerResult->set_value(hr);
+        });
+    }
+    else if (g_testType == PluginTestType::CallbackDuringTermination)
+    {
+        // Validate that the new exclusive m_callbackLock acquire in
+        // _VmTerminate drains in-flight callbacks before m_utilityVm.reset().
+        // Workers are intentionally DETACHED so they keep calling into the
+        // service across OnDistroStopping / _VmTerminate.
+        //
+        // Termination protocol: OnVmStopping (which fires before the drain)
+        // sets g_drainStopAfterFailure. Workers continue until they observe
+        // a failure AFTER the flag is set — the natural race result, since
+        // post-drain calls fail (m_utilityVm is null). This guarantees
+        // workers exit before any subsequent StartWsl creates a new VM,
+        // preventing a "revival" against a fresh m_utilityVm with the same
+        // session/distro IDs.
+        //
+        // Scope: this test exercises only the *happy-path* drain — the
+        // callback (/bin/true) returns in sub-millisecond, so workers are
+        // almost always between iterations when the exclusive lock is
+        // acquired. It is *not* a regression test for the hung-callback
+        // case, where a service-side callback is stuck inside CreateLinuxProcess
+        // waiting on a non-responsive Linux init; that scenario requires
+        // termination-event plumbing through WslCoreInstance::CreateLinuxProcess
+        // and is tracked separately.
+        constexpr int N = 4;
+
+        // Spawn at most once. The post-shutdown StartWsl in
+        // CallbacksDuringTerminationDoNotCrash triggers another
+        // OnDistroStarted; we must not start a fresh batch then or the
+        // workers will leak past end-of-test.
+        if (g_drainWorkersStarted.exchange(true))
+        {
+            return S_OK;
+        }
+
+        g_drainSuccess = 0;
+        g_drainFailures = 0;
+        g_drainStopAfterFailure = false;
+
+        const DWORD sessionId = Session->SessionId;
+        const GUID distroId = Distribution->Id;
+
+        for (int i = 0; i < N; ++i)
+        {
+            std::thread worker([sessionId, distroId]() {
+                while (true)
+                {
+                    wil::unique_socket socket;
+                    std::vector<const char*> args = {"/bin/true", nullptr};
+                    const HRESULT hr = g_api->ExecuteBinaryInDistribution(sessionId, &distroId, args[0], args.data(), &socket);
+                    if (SUCCEEDED(hr))
+                    {
+                        ++g_drainSuccess;
+                    }
+                    else
+                    {
+                        ++g_drainFailures;
+                        if (g_drainStopAfterFailure.load())
+                        {
+                            return;
+                        }
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            });
+            worker.detach();
+        }
+    }
 
     return S_OK;
 }
 
 HRESULT OnDistroStopping(const WSLSessionInformation* Session, const WSLDistributionInformation* Distribution)
 {
-    g_logfile << "Distribution Stopping, name=" << wsl::shared::string::WideToMultiByte(Distribution->Name)
-              << ", package=" << wsl::shared::string::WideToMultiByte(Distribution->PackageFamilyName)
-              << ", PidNs=" << Distribution->PidNamespace << ", Flavor=" << wsl::shared::string::WideToMultiByte(Distribution->Flavor)
-              << ", Version=" << wsl::shared::string::WideToMultiByte(Distribution->Version) << std::endl;
+    // For AsyncApiCall we defer the "Distribution Stopping" line until after
+    // the worker thread has been joined, so the worker's "Async worker output"
+    // line is guaranteed to appear before it in the log.
+    auto logDistroStopping = [&]() {
+        g_logfile << "Distribution Stopping, name=" << wsl::shared::string::WideToMultiByte(Distribution->Name)
+                  << ", package=" << wsl::shared::string::WideToMultiByte(Distribution->PackageFamilyName)
+                  << ", PidNs=" << Distribution->PidNamespace << ", Flavor=" << wsl::shared::string::WideToMultiByte(Distribution->Flavor)
+                  << ", Version=" << wsl::shared::string::WideToMultiByte(Distribution->Version) << std::endl;
+    };
+
+    if (g_testType == PluginTestType::AsyncApiCall)
+    {
+        if (g_asyncWorker.has_value())
+        {
+            // Unconditional join — letting the worker outlive g_pluginHost
+            // (cleared in ~PluginHost) would dereference freed memory.
+            g_asyncWorker->join();
+            g_asyncWorker.reset();
+
+            HRESULT workerHr = S_OK;
+            if (g_asyncWorkerFuture.valid())
+            {
+                workerHr = g_asyncWorkerFuture.get();
+                g_asyncWorkerResult.reset();
+            }
+
+            if (SUCCEEDED(workerHr))
+            {
+                LogLine("Async worker output: " + g_asyncWorkerOutput);
+            }
+            else
+            {
+                LogLine("Async worker failed: " + std::to_string(workerHr));
+            }
+        }
+
+        logDistroStopping();
+        return S_OK;
+    }
+
+    logDistroStopping();
 
     if (g_testType == PluginTestType::FailToStopDistro)
     {
@@ -349,7 +634,7 @@ EXTERN_C __declspec(dllexport) HRESULT WSLPLUGINAPI_ENTRYPOINTV1(const WSLPlugin
         THROW_HR_IF(E_UNEXPECTED, !g_logfile);
 
         g_testType = static_cast<PluginTestType>(ReadDword(key.get(), nullptr, c_testType, static_cast<DWORD>(PluginTestType::Invalid)));
-        THROW_HR_IF(E_INVALIDARG, static_cast<DWORD>(g_testType) <= 0 || static_cast<DWORD>(g_testType) > static_cast<DWORD>(PluginTestType::GetUsername));
+        THROW_HR_IF(E_INVALIDARG, static_cast<DWORD>(g_testType) <= 0 || static_cast<DWORD>(g_testType) > static_cast<DWORD>(PluginTestType::CallbackDuringTermination));
 
         g_logfile << "Plugin loaded. TestMode=" << static_cast<DWORD>(g_testType) << std::endl;
         g_api = Api;
