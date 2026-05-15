@@ -19,6 +19,7 @@ Abstract:
 #include "WSLCContainerLauncher.h"
 #include "WslCoreFilesystem.h"
 #include "hcs.hpp"
+#include "ContainerNameGenerator.h"
 #include <nlohmann/json.hpp>
 
 using namespace std::literals::chrono_literals;
@@ -27,8 +28,8 @@ using wsl::windows::common::RunningWSLCContainer;
 using wsl::windows::common::RunningWSLCProcess;
 using wsl::windows::common::WSLCContainerLauncher;
 using wsl::windows::common::WSLCProcessLauncher;
-using wsl::windows::common::relay::OverlappedIOHandle;
-using wsl::windows::common::relay::WriteHandle;
+using wsl::windows::common::io::OverlappedIOHandle;
+using wsl::windows::common::io::WriteHandle;
 using namespace wsl::windows::common::wslutil;
 
 extern std::wstring g_testDataPath;
@@ -101,7 +102,7 @@ class WSLCTests
         }
 
         PruneResult result;
-        VERIFY_SUCCEEDED(m_defaultSession->PruneContainers(nullptr, 0, 0, &result.result));
+        VERIFY_SUCCEEDED(m_defaultSession->PruneContainers(nullptr, 0, &result.result));
         if (result.result.ContainersCount > 0)
         {
             LogInfo("Pruned %lu containers", result.result.ContainersCount);
@@ -180,6 +181,30 @@ class WSLCTests
         VERIFY_SUCCEEDED(session->OpenContainer(name.c_str(), &rawContainer));
 
         return RunningWSLCContainer(std::move(rawContainer), {});
+    }
+
+    struct ListContainersResult
+    {
+        wil::unique_cotaskmem_array_ptr<WSLCContainerEntry> Containers;
+        wil::unique_cotaskmem_array_ptr<WSLCContainerPortMapping> Ports;
+    };
+
+    // Issues IWSLCSession::ListContainers with WSLCListContainersFlagsAll (all containers, no filter).
+    // If a future caller needs a different flag set, add a parameter.
+    ListContainersResult ListContainers(IWSLCSession* session)
+    {
+        WSLCListContainersOptions options{};
+        options.Flags = WSLCListContainersFlagsAll;
+
+        ListContainersResult result;
+        VERIFY_SUCCEEDED(session->ListContainers(
+            &options,
+            result.Containers.addressof(),
+            result.Containers.size_address<ULONG>(),
+            result.Ports.addressof(),
+            result.Ports.size_address<ULONG>()));
+
+        return result;
     }
 
     std::pair<RunningWSLCContainer, std::string> StartLocalRegistry(const std::string& username = {}, const std::string& password = {}, USHORT port = 5000)
@@ -902,69 +927,94 @@ class WSLCTests
 
         LogInfo("Test: Before/Since filters");
         {
-            // Get all images to find their IDs
+            // Get all images to find their IDs and creation times
             wil::unique_cotaskmem_array_ptr<WSLCImageInformation> allImages;
             VERIFY_SUCCEEDED(m_defaultSession->ListImages(nullptr, allImages.addressof(), allImages.size_address<ULONG>()));
 
             std::string debianId, pythonId;
+            LONGLONG debianCreated = 0, pythonCreated = 0;
             for (const auto& image : allImages)
             {
                 std::string imageName = image.Image;
                 if (imageName == "debian:latest")
                 {
                     debianId = image.Hash;
+                    debianCreated = image.Created;
                 }
                 else if (imageName == "python:3.12-alpine")
                 {
                     pythonId = image.Hash;
+                    pythonCreated = image.Created;
                 }
             }
 
             VERIFY_IS_FALSE(debianId.empty());
             VERIFY_IS_FALSE(pythonId.empty());
 
-            // Test 'since' filter - images created after debian
+            // Both Created timestamps must be populated and distinct so that the since/before
+            // boundaries are unambiguous. Equal timestamps would make Docker's filter behavior
+            // ambiguous and could reintroduce flakiness.
+            VERIFY_IS_GREATER_THAN(debianCreated, 0LL);
+            VERIFY_IS_GREATER_THAN(pythonCreated, 0LL);
+            VERIFY_ARE_NOT_EQUAL(debianCreated, pythonCreated);
+
+            // Determine which image is older/newer based on actual creation timestamps.
+            // Image creation times come from the registry and can change independently.
+            const bool debianIsOlder = debianCreated < pythonCreated;
+            const auto& olderId = debianIsOlder ? debianId : pythonId;
+            const auto& newerId = debianIsOlder ? pythonId : debianId;
+            const auto* olderName = debianIsOlder ? "debian:latest" : "python:3.12-alpine";
+            const auto* newerName = debianIsOlder ? "python:3.12-alpine" : "debian:latest";
+
+            LogInfo(
+                "Older image: %hs (Created: %lld), Newer image: %hs (Created: %lld)",
+                olderName,
+                debianIsOlder ? debianCreated : pythonCreated,
+                newerName,
+                debianIsOlder ? pythonCreated : debianCreated);
+
+            // Test 'since' filter - images created after the older image
             {
                 WSLCListImageOptions options{};
                 options.Flags = WSLCListImagesFlagsNone;
-                options.Since = debianId.c_str();
+                options.Since = olderId.c_str();
 
                 wil::unique_cotaskmem_array_ptr<WSLCImageInformation> images;
                 VERIFY_SUCCEEDED(m_defaultSession->ListImages(&options, images.addressof(), images.size_address<ULONG>()));
                 VERIFY_IS_TRUE(images.size() > 0);
 
-                bool foundPython = false;
+                bool foundNewer = false;
                 for (const auto& image : images)
                 {
                     LogInfo("Image: %hs, Hash: %hs, Created: %lld", image.Image, image.Hash, image.Created);
-                    if (std::string{image.Image} == "python:3.12-alpine")
+                    if (std::string{image.Image} == newerName)
                     {
-                        foundPython = true;
+                        foundNewer = true;
                     }
                 }
 
-                VERIFY_IS_TRUE(foundPython);
+                VERIFY_IS_TRUE(foundNewer);
             }
 
-            // Test 'before' filter - images created before python
+            // Test 'before' filter - images created before the newer image
             {
                 WSLCListImageOptions options{};
                 options.Flags = WSLCListImagesFlagsNone;
-                options.Before = pythonId.c_str();
+                options.Before = newerId.c_str();
                 wil::unique_cotaskmem_array_ptr<WSLCImageInformation> images;
                 VERIFY_SUCCEEDED(m_defaultSession->ListImages(&options, images.addressof(), images.size_address<ULONG>()));
                 VERIFY_IS_TRUE(images.size() > 0);
 
-                bool foundDebian = false;
+                bool foundOlder = false;
                 for (const auto& image : images)
                 {
-                    if (std::string{image.Image} == "debian:latest")
+                    if (std::string{image.Image} == olderName)
                     {
-                        foundDebian = true;
+                        foundOlder = true;
                     }
                 }
 
-                VERIFY_IS_TRUE(foundDebian);
+                VERIFY_IS_TRUE(foundOlder);
             }
         }
 
@@ -2057,11 +2107,7 @@ class WSLCTests
             });
 
             // Validate that the session is correctly restarted.
-            wil::unique_cotaskmem_array_ptr<WSLCContainerEntry> containers;
-            wil::unique_cotaskmem_array_ptr<WSLCContainerPortMapping> ports;
-
-            VERIFY_SUCCEEDED(
-                m_defaultSession->ListContainers(&containers, containers.size_address<ULONG>(), &ports, ports.size_address<ULONG>()));
+            auto [containers, ports] = ListContainers(m_defaultSession.get());
 
             VERIFY_ARE_EQUAL(containers.size(), 1);
             VERIFY_ARE_EQUAL(containers[0].Id, containerId);
@@ -3945,7 +3991,7 @@ class WSLCTests
         // Prune containers on exit so this test doesn't leak "wslc-test-container-vhd" on exit.
         auto cleanup = wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [&]() {
             PruneResult result;
-            LOG_IF_FAILED(m_defaultSession->PruneContainers(nullptr, 0, 0, &result.result));
+            LOG_IF_FAILED(m_defaultSession->PruneContainers(nullptr, 0, &result.result));
         });
 
         WSLCVolumeOptions volumeOptions{};
@@ -4109,26 +4155,142 @@ class WSLCTests
 
         // Invalid SizeBytes values.
         WSLCDriverOption emptySize[] = {{"SizeBytes", ""}};
-        validateInvalidOptionsFailure(emptySize, ARRAYSIZE(emptySize), E_INVALIDARG, L"Invalid size: ");
+        validateInvalidOptionsFailure(emptySize, ARRAYSIZE(emptySize), E_INVALIDARG, L"Invalid value for option 'SizeBytes': ''");
 
         WSLCDriverOption zeroSize[] = {{"SizeBytes", "0"}};
-        validateInvalidOptionsFailure(zeroSize, ARRAYSIZE(zeroSize), E_INVALIDARG, L"Invalid size: 0");
+        validateInvalidOptionsFailure(zeroSize, ARRAYSIZE(zeroSize), E_INVALIDARG, L"Invalid value for option 'SizeBytes': '0'");
 
         WSLCDriverOption invalidSizeAbc[] = {{"SizeBytes", "abc"}};
-        validateInvalidOptionsFailure(invalidSizeAbc, ARRAYSIZE(invalidSizeAbc), E_INVALIDARG, L"Invalid size: abc");
+        validateInvalidOptionsFailure(
+            invalidSizeAbc, ARRAYSIZE(invalidSizeAbc), E_INVALIDARG, L"Invalid value for option 'SizeBytes': 'abc'");
 
         WSLCDriverOption invalidSizeMixed[] = {{"SizeBytes", "123abc"}};
-        validateInvalidOptionsFailure(invalidSizeMixed, ARRAYSIZE(invalidSizeMixed), E_INVALIDARG, L"Invalid size: 123abc");
+        validateInvalidOptionsFailure(
+            invalidSizeMixed, ARRAYSIZE(invalidSizeMixed), E_INVALIDARG, L"Invalid value for option 'SizeBytes': '123abc'");
 
         WSLCDriverOption invalidSizeSign[] = {{"SizeBytes", "+-1"}};
-        validateInvalidOptionsFailure(invalidSizeSign, ARRAYSIZE(invalidSizeSign), E_INVALIDARG, L"Invalid size: +-1");
+        validateInvalidOptionsFailure(
+            invalidSizeSign, ARRAYSIZE(invalidSizeSign), E_INVALIDARG, L"Invalid value for option 'SizeBytes': '+-1'");
 
         WSLCDriverOption invalidSizeOverflow[] = {{"SizeBytes", "18446744073709551616"}};
         validateInvalidOptionsFailure(
-            invalidSizeOverflow, ARRAYSIZE(invalidSizeOverflow), E_INVALIDARG, L"Invalid size: 18446744073709551616");
+            invalidSizeOverflow,
+            ARRAYSIZE(invalidSizeOverflow),
+            E_INVALIDARG,
+            L"Invalid value for option 'SizeBytes': '18446744073709551616'");
 
         WSLCDriverOption invalidSizeNeg[] = {{"SizeBytes", "-1"}};
-        validateInvalidOptionsFailure(invalidSizeNeg, ARRAYSIZE(invalidSizeNeg), E_INVALIDARG, L"Invalid size: -1");
+        validateInvalidOptionsFailure(
+            invalidSizeNeg, ARRAYSIZE(invalidSizeNeg), E_INVALIDARG, L"Invalid value for option 'SizeBytes': '-1'");
+
+        // Invalid Fixed values.
+        WSLCDriverOption invalidFixed[] = {{"SizeBytes", "1073741824"}, {"Fixed", "yes"}};
+        validateInvalidOptionsFailure(
+            invalidFixed, ARRAYSIZE(invalidFixed), E_INVALIDARG, L"Invalid value for option 'Fixed': 'yes'");
+
+        WSLCDriverOption emptyFixed[] = {{"SizeBytes", "1073741824"}, {"Fixed", ""}};
+        validateInvalidOptionsFailure(emptyFixed, ARRAYSIZE(emptyFixed), E_INVALIDARG, L"Invalid value for option 'Fixed': ''");
+
+        // Invalid Uid values. Tests pair Uid with a valid Gid because Parse
+        // requires both to be present together.
+        WSLCDriverOption negUid[] = {{"SizeBytes", "1073741824"}, {"Uid", "-1"}, {"Gid", "0"}};
+        validateInvalidOptionsFailure(negUid, ARRAYSIZE(negUid), E_INVALIDARG, L"Invalid value for option 'Uid': '-1'");
+
+        WSLCDriverOption abcUid[] = {{"SizeBytes", "1073741824"}, {"Uid", "abc"}, {"Gid", "0"}};
+        validateInvalidOptionsFailure(abcUid, ARRAYSIZE(abcUid), E_INVALIDARG, L"Invalid value for option 'Uid': 'abc'");
+
+        WSLCDriverOption hugeUid[] = {{"SizeBytes", "1073741824"}, {"Uid", "4294967296"}, {"Gid", "0"}}; // 2^32, exceeds uint32_t max
+        validateInvalidOptionsFailure(hugeUid, ARRAYSIZE(hugeUid), E_INVALIDARG, L"Invalid value for option 'Uid': '4294967296'");
+
+        // Invalid Gid values.
+        WSLCDriverOption negGid[] = {{"SizeBytes", "1073741824"}, {"Uid", "0"}, {"Gid", "-1"}};
+        validateInvalidOptionsFailure(negGid, ARRAYSIZE(negGid), E_INVALIDARG, L"Invalid value for option 'Gid': '-1'");
+
+        // Uid without Gid (or vice versa) is rejected.
+        WSLCDriverOption uidOnly[] = {{"SizeBytes", "1073741824"}, {"Uid", "1000"}};
+        validateInvalidOptionsFailure(uidOnly, ARRAYSIZE(uidOnly), E_INVALIDARG, L"Missing required option: 'Gid'");
+
+        WSLCDriverOption gidOnly[] = {{"SizeBytes", "1073741824"}, {"Gid", "1000"}};
+        validateInvalidOptionsFailure(gidOnly, ARRAYSIZE(gidOnly), E_INVALIDARG, L"Missing required option: 'Uid'");
+
+        // Unknown options are rejected (catches typos and unsupported keys).
+        WSLCDriverOption unknownOpt[] = {{"SizeBytes", "1073741824"}, {"Bogus", "value"}};
+        validateInvalidOptionsFailure(unknownOpt, ARRAYSIZE(unknownOpt), E_INVALIDARG, L"Unknown option: 'Bogus'");
+    }
+
+    WSLC_TEST_METHOD(NamedVolumesVhdOwnership)
+    {
+        // Verify Uid/Gid are baked into the root inode at mkfs time so a
+        // non-root container user can write to the volume.
+        const std::string volumeName = "wslc-test-vhd-ownership";
+
+        LOG_IF_FAILED(m_defaultSession->DeleteVolume(volumeName.c_str()));
+        auto cleanup = wil::scope_exit([&]() { LOG_IF_FAILED(m_defaultSession->DeleteVolume(volumeName.c_str())); });
+
+        // nobody/nogroup are typically uid=65534 / gid=65534 on Debian.
+        WSLCDriverOption driverOpts[] = {{"SizeBytes", "1073741824"}, {"Uid", "65534"}, {"Gid", "65534"}};
+
+        WSLCVolumeOptions volumeOptions{};
+        volumeOptions.Name = volumeName.c_str();
+        volumeOptions.Driver = "vhd";
+        volumeOptions.DriverOpts = driverOpts;
+        volumeOptions.DriverOptsCount = ARRAYSIZE(driverOpts);
+
+        WSLCVolumeInformation volInfo{};
+        VERIFY_SUCCEEDED(m_defaultSession->CreateVolume(&volumeOptions, &volInfo));
+
+        // A container running as 'nobody' should be able to write to the volume.
+        {
+            WSLCContainerLauncher writer(
+                "debian:latest", "vhd-ownership-writer", {"/bin/sh", "-c", "echo non-root >/data/marker.txt"});
+            writer.AddNamedVolume(volumeName, "/data", false);
+            writer.SetUser("nobody:nogroup");
+
+            auto writerContainer = writer.Launch(*m_defaultSession);
+            auto writerProcess = writerContainer.GetInitProcess();
+            ValidateProcessOutput(writerProcess, {});
+        }
+
+        // Verify the file is owned by the same uid/gid as the volume root.
+        {
+            WSLCContainerLauncher checker(
+                "debian:latest", "vhd-ownership-checker", {"/bin/sh", "-c", "stat -c '%u %g' /data && cat /data/marker.txt"});
+            checker.AddNamedVolume(volumeName, "/data", true);
+
+            auto checkerContainer = checker.Launch(*m_defaultSession);
+            auto checkerProcess = checkerContainer.GetInitProcess();
+            ValidateProcessOutput(checkerProcess, {{1, "65534 65534\nnon-root\n"}});
+        }
+    }
+
+    WSLC_TEST_METHOD(NamedVolumesVhdFixed)
+    {
+        // Fixed=true produces a .vhdx whose on-disk size is at least SizeBytes.
+        const std::string volumeName = "wslc-test-vhd-fixed";
+        const std::filesystem::path volumeVhdPath = m_storagePath / "volumes" / (volumeName + ".vhdx");
+        constexpr ULONGLONG c_sizeBytes = 64 * _1MB;
+
+        LOG_IF_FAILED(m_defaultSession->DeleteVolume(volumeName.c_str()));
+        auto cleanup = wil::scope_exit([&]() { LOG_IF_FAILED(m_defaultSession->DeleteVolume(volumeName.c_str())); });
+
+        const auto sizeBytesStr = std::to_string(c_sizeBytes);
+        WSLCDriverOption driverOpts[] = {{"SizeBytes", sizeBytesStr.c_str()}, {"Fixed", "true"}};
+
+        WSLCVolumeOptions volumeOptions{};
+        volumeOptions.Name = volumeName.c_str();
+        volumeOptions.Driver = "vhd";
+        volumeOptions.DriverOpts = driverOpts;
+        volumeOptions.DriverOptsCount = ARRAYSIZE(driverOpts);
+
+        WSLCVolumeInformation volInfo{};
+        VERIFY_SUCCEEDED(m_defaultSession->CreateVolume(&volumeOptions, &volInfo));
+
+        VERIFY_IS_TRUE(std::filesystem::exists(volumeVhdPath));
+        const auto fileSize = std::filesystem::file_size(volumeVhdPath);
+
+        // A dynamic VHD for a 64MB volume is typically a few MB; a fixed VHD
+        // pre-allocates the full payload (>= SizeBytes).
+        VERIFY_IS_GREATER_THAN_OR_EQUAL(fileSize, c_sizeBytes);
     }
 
     WSLC_TEST_METHOD(ListAndInspectNamedVolumesTest)
@@ -5130,11 +5292,7 @@ class WSLCTests
     WSLC_TEST_METHOD(ContainerState)
     {
         auto expectContainerList = [&](const std::vector<std::tuple<std::string, std::string, WSLCContainerState>>& expectedContainers) {
-            wil::unique_cotaskmem_array_ptr<WSLCContainerEntry> containers;
-            wil::unique_cotaskmem_array_ptr<WSLCContainerPortMapping> ports;
-
-            VERIFY_SUCCEEDED(
-                m_defaultSession->ListContainers(&containers, containers.size_address<ULONG>(), &ports, ports.size_address<ULONG>()));
+            auto [containers, ports] = ListContainers(m_defaultSession.get());
             VERIFY_ARE_EQUAL(expectedContainers.size(), containers.size());
 
             for (size_t i = 0; i < expectedContainers.size(); i++)
@@ -5176,10 +5334,7 @@ class WSLCTests
             ULONGLONG runningStateChangedAt{};
             ULONGLONG runningCreatedAt{};
             {
-                wil::unique_cotaskmem_array_ptr<WSLCContainerEntry> containers;
-                wil::unique_cotaskmem_array_ptr<WSLCContainerPortMapping> ports;
-                VERIFY_SUCCEEDED(m_defaultSession->ListContainers(
-                    &containers, containers.size_address<ULONG>(), &ports, ports.size_address<ULONG>()));
+                auto [containers, ports] = ListContainers(m_defaultSession.get());
                 VERIFY_ARE_EQUAL(containers.size(), 1);
                 runningStateChangedAt = containers[0].StateChangedAt;
                 runningCreatedAt = containers[0].CreatedAt;
@@ -5205,10 +5360,7 @@ class WSLCTests
 
             // Verify that StateChangedAt was updated after the state transition.
             {
-                wil::unique_cotaskmem_array_ptr<WSLCContainerEntry> containers;
-                wil::unique_cotaskmem_array_ptr<WSLCContainerPortMapping> ports;
-                VERIFY_SUCCEEDED(m_defaultSession->ListContainers(
-                    &containers, containers.size_address<ULONG>(), &ports, ports.size_address<ULONG>()));
+                auto [containers, ports] = ListContainers(m_defaultSession.get());
                 VERIFY_ARE_EQUAL(containers.size(), 1);
 
                 auto now = static_cast<ULONGLONG>(time(nullptr));
@@ -5449,14 +5601,123 @@ class WSLCTests
         }
     }
 
+    WSLC_TEST_METHOD(ContainerListFilter)
+    {
+        // Lists containers with the given filter options and returns the names as a set.
+        auto listContainers = [&](DWORD flags, std::initializer_list<std::pair<std::string, std::string>> filterPairs) {
+            std::vector<std::pair<std::string, std::string>> storage(filterPairs.begin(), filterPairs.end());
+            std::vector<WSLCFilter> filters;
+            filters.reserve(storage.size());
+            for (const auto& [k, v] : storage)
+            {
+                filters.push_back({.Key = k.c_str(), .Value = v.c_str()});
+            }
+
+            WSLCListContainersOptions options{};
+            options.Flags = flags;
+            options.Filters = filters.data();
+            options.FiltersCount = static_cast<ULONG>(filters.size());
+
+            wil::unique_cotaskmem_array_ptr<WSLCContainerEntry> containers;
+            wil::unique_cotaskmem_array_ptr<WSLCContainerPortMapping> ports;
+            VERIFY_SUCCEEDED(m_defaultSession->ListContainers(
+                &options, &containers, containers.size_address<ULONG>(), &ports, ports.size_address<ULONG>()));
+
+            std::set<std::string> names;
+            for (const auto& c : containers)
+            {
+                names.insert(c.Name);
+            }
+            return names;
+        };
+
+        auto expectContainers =
+            [&](DWORD flags, std::initializer_list<std::pair<std::string, std::string>> filterPairs, std::set<std::string> expected) {
+                VERIFY_ARE_EQUAL(expected, listContainers(flags, filterPairs));
+            };
+
+        // Set up: one running container, one exited container, one created container.
+        WSLCContainerLauncher runningLauncher("debian:latest", "filter-running", {"sleep", "99999"});
+        runningLauncher.AddLabel("filter.test", "yes");
+        runningLauncher.AddLabel("filter.role", "primary");
+        auto runningContainer = runningLauncher.Launch(*m_defaultSession);
+        VERIFY_ARE_EQUAL(runningContainer.State(), WslcContainerStateRunning);
+        std::string runningId = runningContainer.Id();
+
+        WSLCContainerLauncher exitedLauncher("debian:latest", "filter-exited", {"true"});
+        exitedLauncher.AddLabel("filter.test", "yes");
+        auto exitedContainer = exitedLauncher.Launch(*m_defaultSession);
+        exitedContainer.GetInitProcess().Wait();
+        VERIFY_ARE_EQUAL(exitedContainer.State(), WslcContainerStateExited);
+
+        WSLCContainerLauncher createdLauncher("debian:latest", "filter-created", {"echo", "hi"});
+        auto createdContainer = createdLauncher.Create(*m_defaultSession);
+        VERIFY_ARE_EQUAL(createdContainer.State(), WslcContainerStateCreated);
+
+        auto cleanup = wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [&]() {
+            LOG_IF_FAILED(runningContainer.Get().Delete(WSLCDeleteFlagsForce));
+            LOG_IF_FAILED(exitedContainer.Get().Delete(WSLCDeleteFlagsForce));
+            LOG_IF_FAILED(createdContainer.Get().Delete(WSLCDeleteFlagsForce));
+        });
+
+        // Default (Flags=None, no filters) -> only running containers visible.
+        expectContainers(WSLCListContainersFlagsNone, {}, {"filter-running"});
+
+        // --all (Flags=All, no filters) -> all three visible.
+        expectContainers(WSLCListContainersFlagsAll, {}, {"filter-running", "filter-exited", "filter-created"});
+
+        // status=exited
+        expectContainers(WSLCListContainersFlagsAll, {{"status", "exited"}}, {"filter-exited"});
+
+        // status=running OR status=created (multiple values for the same key are OR'd by Docker).
+        expectContainers(
+            WSLCListContainersFlagsAll, {{"status", "running"}, {"status", "created"}}, {"filter-running", "filter-created"});
+
+        // name=filter-running
+        expectContainers(WSLCListContainersFlagsAll, {{"name", "filter-running"}}, {"filter-running"});
+
+        // id prefix match
+        expectContainers(WSLCListContainersFlagsAll, {{"id", runningId.substr(0, 12)}}, {"filter-running"});
+
+        // label=filter.test (key-only) matches running and exited (both have the label).
+        expectContainers(WSLCListContainersFlagsAll, {{"label", "filter.test"}}, {"filter-running", "filter-exited"});
+
+        // label=filter.role=primary (key=value) matches only the running container.
+        expectContainers(WSLCListContainersFlagsAll, {{"label", "filter.role=primary"}}, {"filter-running"});
+
+        // Multiple keys are AND'd: status=exited AND label=filter.test.
+        expectContainers(WSLCListContainersFlagsAll, {{"status", "exited"}, {"label", "filter.test"}}, {"filter-exited"});
+
+        // before=filter-exited -> only containers created before filter-exited are visible.
+        expectContainers(WSLCListContainersFlagsAll, {{"before", "filter-exited"}}, {"filter-running"});
+
+        // since=filter-running -> only containers created after filter-running are visible.
+        expectContainers(WSLCListContainersFlagsAll, {{"since", "filter-running"}}, {"filter-exited", "filter-created"});
+
+        // exited=0 -> only the exited container that completed successfully.
+        expectContainers(WSLCListContainersFlagsAll, {{"exited", "0"}}, {"filter-exited"});
+
+        // Limit caps the result count.
+        {
+            WSLCListContainersOptions options{};
+            options.Flags = WSLCListContainersFlagsAll;
+            options.Limit = 1;
+
+            wil::unique_cotaskmem_array_ptr<WSLCContainerEntry> containers;
+            wil::unique_cotaskmem_array_ptr<WSLCContainerPortMapping> ports;
+            VERIFY_SUCCEEDED(m_defaultSession->ListContainers(
+                &options, &containers, containers.size_address<ULONG>(), &ports, ports.size_address<ULONG>()));
+
+            // Docker returns at most one container; we intersect with the
+            // session list so the actual count should also be at most one.
+            VERIFY_IS_TRUE(containers.size() <= 1u);
+        }
+    }
+
     WSLC_TEST_METHOD(ContainerNetwork)
     {
         auto expectContainerList = [&](const std::vector<std::tuple<std::string, std::string, WSLCContainerState>>& expectedContainers) {
-            wil::unique_cotaskmem_array_ptr<WSLCContainerEntry> containers;
-            wil::unique_cotaskmem_array_ptr<WSLCContainerPortMapping> ports;
-
-            VERIFY_SUCCEEDED(
-                m_defaultSession->ListContainers(&containers, containers.size_address<ULONG>(), &ports, ports.size_address<ULONG>()));
+            auto [containers, ports] = ListContainers(m_defaultSession.get());
             VERIFY_ARE_EQUAL(expectedContainers.size(), containers.size());
 
             for (size_t i = 0; i < expectedContainers.size(); i++)
@@ -5611,7 +5872,10 @@ class WSLCTests
         options.Name = "test-custom-network-empty";
         options.InitProcessOptions.CommandLine = {.Values = args, .Count = ARRAYSIZE(args)};
         options.ContainerNetwork.ContainerNetworkType = WSLCContainerNetworkTypeCustom;
-        options.ContainerNetwork.ContainerNetworkName = "";
+        WSLCNetworkAttachment emptyNet{};
+        emptyNet.NetworkName = "";
+        options.ContainerNetwork.Networks = &emptyNet;
+        options.ContainerNetwork.NetworksCount = 1;
 
         wil::com_ptr<IWSLCContainer> container;
         auto hr = m_defaultSession->CreateContainer(&options, &container);
@@ -5751,6 +6015,254 @@ class WSLCTests
         VERIFY_ARE_EQUAL(recoveredContainer.State(), WslcContainerStateRunning);
 
         VERIFY_ARE_EQUAL(recoveredContainer.Inspect().HostConfig.NetworkMode, networkName);
+    }
+
+    WSLC_TEST_METHOD(ContainerMultipleNetworksTest)
+    {
+        const std::string primaryNetwork = "multi-net-primary";
+        const std::string additionalNetwork = "multi-net-additional";
+
+        LOG_IF_FAILED(m_defaultSession->DeleteNetwork(primaryNetwork.c_str()));
+        LOG_IF_FAILED(m_defaultSession->DeleteNetwork(additionalNetwork.c_str()));
+
+        WSLCDriverOption primaryOpts[] = {{"Subnet", "172.40.0.0/16"}};
+        WSLCNetworkOptions primaryNetOpts{};
+        primaryNetOpts.Name = primaryNetwork.c_str();
+        primaryNetOpts.Driver = "bridge";
+        primaryNetOpts.DriverOpts = primaryOpts;
+        primaryNetOpts.DriverOptsCount = ARRAYSIZE(primaryOpts);
+        VERIFY_SUCCEEDED(m_defaultSession->CreateNetwork(&primaryNetOpts));
+        auto primaryCleanup = wil::scope_exit([&]() { LOG_IF_FAILED(m_defaultSession->DeleteNetwork(primaryNetwork.c_str())); });
+
+        WSLCDriverOption additionalOpts[] = {{"Subnet", "172.41.0.0/16"}};
+        WSLCNetworkOptions additionalNetOpts{};
+        additionalNetOpts.Name = additionalNetwork.c_str();
+        additionalNetOpts.Driver = "bridge";
+        additionalNetOpts.DriverOpts = additionalOpts;
+        additionalNetOpts.DriverOptsCount = ARRAYSIZE(additionalOpts);
+        VERIFY_SUCCEEDED(m_defaultSession->CreateNetwork(&additionalNetOpts));
+        auto additionalCleanup =
+            wil::scope_exit([&]() { LOG_IF_FAILED(m_defaultSession->DeleteNetwork(additionalNetwork.c_str())); });
+
+        WSLCContainerLauncher launcher(
+            "debian:latest", "test-multi-net", {"sleep", "99999"}, {}, WSLCContainerNetworkType::WSLCContainerNetworkTypeCustom);
+        launcher.SetContainerNetworkName(std::string(primaryNetwork));
+        launcher.AddAdditionalNetwork(additionalNetwork);
+
+        auto container = launcher.Launch(*m_defaultSession);
+        VERIFY_ARE_EQUAL(container.State(), WslcContainerStateRunning);
+
+        auto inspect = container.Inspect();
+        VERIFY_ARE_EQUAL(inspect.HostConfig.NetworkMode, primaryNetwork);
+        VERIFY_IS_TRUE(inspect.NetworkSettings.Networks.contains(primaryNetwork));
+        VERIFY_IS_TRUE(inspect.NetworkSettings.Networks.contains(additionalNetwork));
+        VERIFY_IS_FALSE(inspect.NetworkSettings.Networks.at(primaryNetwork).IPAddress.empty());
+        VERIFY_IS_FALSE(inspect.NetworkSettings.Networks.at(additionalNetwork).IPAddress.empty());
+    }
+
+    WSLC_TEST_METHOD(ContainerAdditionalNetworksRejectedForHostAndNoneTest)
+    {
+        // This check runs before network existence is validated, so no real network needs to exist.
+        const std::string additionalNetwork = "any-additional-net";
+
+        {
+            WSLCContainerLauncher launcher(
+                "debian:latest", "test-multi-net-host-reject", {"sleep", "99999"}, {}, WSLCContainerNetworkType::WSLCContainerNetworkTypeHost);
+            launcher.AddAdditionalNetwork(additionalNetwork);
+
+            auto retVal = launcher.LaunchNoThrow(*m_defaultSession);
+            VERIFY_ARE_EQUAL(E_INVALIDARG, retVal.first);
+            ValidateCOMErrorMessage(L"Additional networks are not allowed when the primary network mode is 'host' or 'none'.");
+        }
+
+        {
+            WSLCContainerLauncher launcher(
+                "debian:latest", "test-multi-net-none-reject", {"sleep", "99999"}, {}, WSLCContainerNetworkType::WSLCContainerNetworkTypeNone);
+            launcher.AddAdditionalNetwork(additionalNetwork);
+
+            auto retVal = launcher.LaunchNoThrow(*m_defaultSession);
+            VERIFY_ARE_EQUAL(E_INVALIDARG, retVal.first);
+            ValidateCOMErrorMessage(L"Additional networks are not allowed when the primary network mode is 'host' or 'none'.");
+        }
+    }
+
+    WSLC_TEST_METHOD(ContainerDuplicateNetworkRejectedTest)
+    {
+        const std::string primaryNetwork = "multi-net-dup-primary";
+
+        LOG_IF_FAILED(m_defaultSession->DeleteNetwork(primaryNetwork.c_str()));
+
+        WSLCDriverOption opts[] = {{"Subnet", "172.48.0.0/16"}};
+        WSLCNetworkOptions netOpts{};
+        netOpts.Name = primaryNetwork.c_str();
+        netOpts.Driver = "bridge";
+        netOpts.DriverOpts = opts;
+        netOpts.DriverOptsCount = ARRAYSIZE(opts);
+        VERIFY_SUCCEEDED(m_defaultSession->CreateNetwork(&netOpts));
+        auto cleanup = wil::scope_exit([&]() { LOG_IF_FAILED(m_defaultSession->DeleteNetwork(primaryNetwork.c_str())); });
+
+        WSLCContainerLauncher launcher(
+            "debian:latest", "test-multi-net-dup-reject", {"sleep", "99999"}, {}, WSLCContainerNetworkType::WSLCContainerNetworkTypeCustom);
+        launcher.SetContainerNetworkName(std::string(primaryNetwork));
+        launcher.AddAdditionalNetwork(primaryNetwork);
+
+        auto retVal = launcher.LaunchNoThrow(*m_defaultSession);
+        VERIFY_ARE_EQUAL(E_INVALIDARG, retVal.first);
+        ValidateCOMErrorMessage(
+            std::format(L"Duplicate network: '{}'", std::wstring(primaryNetwork.begin(), primaryNetwork.end())).c_str());
+    }
+
+    WSLC_TEST_METHOD(ContainerAdditionalNetworkNotFoundRejectedTest)
+    {
+        const std::string primaryNetwork = "multi-net-notfound-primary";
+        const std::string missingNetwork = "multi-net-nonexistent";
+
+        LOG_IF_FAILED(m_defaultSession->DeleteNetwork(primaryNetwork.c_str()));
+        LOG_IF_FAILED(m_defaultSession->DeleteNetwork(missingNetwork.c_str()));
+
+        WSLCDriverOption opts[] = {{"Subnet", "172.49.0.0/16"}};
+        WSLCNetworkOptions netOpts{};
+        netOpts.Name = primaryNetwork.c_str();
+        netOpts.Driver = "bridge";
+        netOpts.DriverOpts = opts;
+        netOpts.DriverOptsCount = ARRAYSIZE(opts);
+        VERIFY_SUCCEEDED(m_defaultSession->CreateNetwork(&netOpts));
+        auto cleanup = wil::scope_exit([&]() { LOG_IF_FAILED(m_defaultSession->DeleteNetwork(primaryNetwork.c_str())); });
+
+        WSLCContainerLauncher launcher(
+            "debian:latest", "test-multi-net-notfound-reject", {"sleep", "99999"}, {}, WSLCContainerNetworkType::WSLCContainerNetworkTypeCustom);
+        launcher.SetContainerNetworkName(std::string(primaryNetwork));
+        launcher.AddAdditionalNetwork(missingNetwork);
+
+        auto retVal = launcher.LaunchNoThrow(*m_defaultSession);
+        VERIFY_ARE_EQUAL(WSLC_E_NETWORK_NOT_FOUND, retVal.first);
+        ValidateCOMErrorMessage(
+            std::format(L"Network not found: '{}'", std::wstring(missingNetwork.begin(), missingNetwork.end())).c_str());
+    }
+
+    WSLC_TEST_METHOD(ContainerBridgedPrimaryDuplicateNetworkRejectedTest)
+    {
+        // Verifies that passing the primary bridge network as an additional network is caught as a duplicate.
+        WSLCContainerLauncher launcher(
+            "debian:latest", "test-bridge-dup-reject", {"sleep", "99999"}, {}, WSLCContainerNetworkType::WSLCContainerNetworkTypeBridged);
+        launcher.AddAdditionalNetwork("bridge");
+
+        auto retVal = launcher.LaunchNoThrow(*m_defaultSession);
+        VERIFY_ARE_EQUAL(E_INVALIDARG, retVal.first);
+        ValidateCOMErrorMessage(L"Duplicate network: 'bridge'");
+    }
+
+    WSLC_TEST_METHOD(ContainerAdditionalNetworkMalformedNameTest)
+    {
+        // Most malformed names fall through to the network lookup.
+
+        // Invalid character.
+        {
+            WSLCContainerLauncher launcher(
+                "debian:latest", "test-invalid-name-char", {"sleep", "99999"}, {}, WSLCContainerNetworkType::WSLCContainerNetworkTypeBridged);
+            launcher.AddAdditionalNetwork("bad/name");
+
+            auto retVal = launcher.LaunchNoThrow(*m_defaultSession);
+            VERIFY_ARE_EQUAL(WSLC_E_NETWORK_NOT_FOUND, retVal.first);
+            ValidateCOMErrorMessage(L"Network not found: 'bad/name'");
+        }
+
+        // Empty name.
+        {
+            WSLCContainerLauncher launcher(
+                "debian:latest", "test-invalid-name-empty", {"sleep", "99999"}, {}, WSLCContainerNetworkType::WSLCContainerNetworkTypeBridged);
+            launcher.AddAdditionalNetwork("");
+
+            auto retVal = launcher.LaunchNoThrow(*m_defaultSession);
+            VERIFY_ARE_EQUAL(E_INVALIDARG, retVal.first);
+            ValidateCOMErrorMessage(L"Network name cannot be empty.");
+        }
+
+        // Name exceeds WSLC_MAX_NETWORK_NAME_LENGTH (255).
+        {
+            const std::string tooLongName(WSLC_MAX_NETWORK_NAME_LENGTH + 1, 'a');
+
+            WSLCContainerLauncher launcher(
+                "debian:latest", "test-invalid-name-long", {"sleep", "99999"}, {}, WSLCContainerNetworkType::WSLCContainerNetworkTypeBridged);
+            launcher.AddAdditionalNetwork(tooLongName);
+
+            auto retVal = launcher.LaunchNoThrow(*m_defaultSession);
+            VERIFY_ARE_EQUAL(WSLC_E_NETWORK_NOT_FOUND, retVal.first);
+            ValidateCOMErrorMessage(std::format(L"Network not found: '{}'", std::wstring(tooLongName.begin(), tooLongName.end())).c_str());
+        }
+    }
+
+    WSLC_TEST_METHOD(ContainerDeleteAdditionalNetworkWhileInUseTest)
+    {
+        const std::string primaryNetwork = "multi-net-del-primary";
+        const std::string additionalNetwork = "multi-net-del-additional";
+
+        LOG_IF_FAILED(m_defaultSession->DeleteNetwork(primaryNetwork.c_str()));
+        LOG_IF_FAILED(m_defaultSession->DeleteNetwork(additionalNetwork.c_str()));
+
+        WSLCDriverOption primaryOpts[] = {{"Subnet", "172.50.0.0/16"}};
+        WSLCNetworkOptions primaryNetOpts{};
+        primaryNetOpts.Name = primaryNetwork.c_str();
+        primaryNetOpts.Driver = "bridge";
+        primaryNetOpts.DriverOpts = primaryOpts;
+        primaryNetOpts.DriverOptsCount = ARRAYSIZE(primaryOpts);
+        VERIFY_SUCCEEDED(m_defaultSession->CreateNetwork(&primaryNetOpts));
+        auto primaryCleanup = wil::scope_exit([&]() { LOG_IF_FAILED(m_defaultSession->DeleteNetwork(primaryNetwork.c_str())); });
+
+        WSLCDriverOption additionalOpts[] = {{"Subnet", "172.51.0.0/16"}};
+        WSLCNetworkOptions additionalNetOpts{};
+        additionalNetOpts.Name = additionalNetwork.c_str();
+        additionalNetOpts.Driver = "bridge";
+        additionalNetOpts.DriverOpts = additionalOpts;
+        additionalNetOpts.DriverOptsCount = ARRAYSIZE(additionalOpts);
+        VERIFY_SUCCEEDED(m_defaultSession->CreateNetwork(&additionalNetOpts));
+        auto additionalCleanup =
+            wil::scope_exit([&]() { LOG_IF_FAILED(m_defaultSession->DeleteNetwork(additionalNetwork.c_str())); });
+
+        WSLCContainerLauncher launcher(
+            "debian:latest", "test-multi-net-del", {"sleep", "99999"}, {}, WSLCContainerNetworkType::WSLCContainerNetworkTypeCustom);
+        launcher.SetContainerNetworkName(std::string(primaryNetwork));
+        launcher.AddAdditionalNetwork(additionalNetwork);
+
+        auto container = launcher.Launch(*m_defaultSession);
+        VERIFY_ARE_EQUAL(container.State(), WslcContainerStateRunning);
+
+        VERIFY_ARE_EQUAL(HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION), m_defaultSession->DeleteNetwork(additionalNetwork.c_str()));
+    }
+
+    WSLC_TEST_METHOD(ContainerNetworkAttachmentIpAddressRejectedTest)
+    {
+        // ContainerIpAddress is reserved and must be null today.
+        LPCSTR args[] = {"sleep", "99999"};
+
+        WSLCContainerOptions options{};
+        options.Image = "debian:latest";
+        options.Name = "test-network-ip-reserved";
+        options.InitProcessOptions.CommandLine = {.Values = args, .Count = ARRAYSIZE(args)};
+        options.ContainerNetwork.ContainerNetworkType = WSLCContainerNetworkTypeBridged;
+        WSLCNetworkAttachment netWithIp{};
+        netWithIp.NetworkName = "bridge";
+        netWithIp.ContainerIpAddress = "10.0.0.5";
+        options.ContainerNetwork.Networks = &netWithIp;
+        options.ContainerNetwork.NetworksCount = 1;
+
+        wil::com_ptr<IWSLCContainer> container;
+        auto hr = m_defaultSession->CreateContainer(&options, &container);
+        VERIFY_ARE_EQUAL(E_NOTIMPL, hr);
+        ValidateCOMErrorMessage(L"ContainerIpAddress is not yet supported.");
+    }
+
+    WSLC_TEST_METHOD(ContainerCustomNetworkMissingPrimaryWithAdditionalRejectedTest)
+    {
+        // Custom + additional networks without a primary network name must be rejected,
+        // not silently promote the first additional to primary.
+        WSLCContainerLauncher launcher(
+            "debian:latest", "test-custom-no-primary", {"sleep", "99999"}, {}, WSLCContainerNetworkType::WSLCContainerNetworkTypeCustom);
+        launcher.AddAdditionalNetwork("any-net");
+
+        auto retVal = launcher.LaunchNoThrow(*m_defaultSession);
+        VERIFY_ARE_EQUAL(E_INVALIDARG, retVal.first);
+        ValidateCOMErrorMessage(L"Container network name is required for custom network type.");
     }
 
     WSLC_TEST_METHOD(ContainerInspect)
@@ -6143,7 +6655,8 @@ class WSLCTests
             {
                 wil::unique_cotaskmem_array_ptr<WSLCContainerEntry> containers;
                 wil::unique_cotaskmem_array_ptr<WSLCContainerPortMapping> ports;
-                VERIFY_SUCCEEDED(session.ListContainers(&containers, containers.size_address<ULONG>(), &ports, ports.size_address<ULONG>()));
+                VERIFY_SUCCEEDED(session.ListContainers(
+                    nullptr, &containers, containers.size_address<ULONG>(), &ports, ports.size_address<ULONG>()));
 
                 // Find the container ID for "test-ports"
                 std::string testPortsId;
@@ -6187,7 +6700,8 @@ class WSLCTests
 
                 wil::unique_cotaskmem_array_ptr<WSLCContainerEntry> containers;
                 wil::unique_cotaskmem_array_ptr<WSLCContainerPortMapping> ports;
-                VERIFY_SUCCEEDED(session.ListContainers(&containers, containers.size_address<ULONG>(), &ports, ports.size_address<ULONG>()));
+                VERIFY_SUCCEEDED(session.ListContainers(
+                    nullptr, &containers, containers.size_address<ULONG>(), &ports, ports.size_address<ULONG>()));
 
                 std::string createdId = createdContainer.Id();
                 for (const auto& port : ports)
@@ -6215,7 +6729,8 @@ class WSLCTests
             {
                 wil::unique_cotaskmem_array_ptr<WSLCContainerEntry> containers;
                 wil::unique_cotaskmem_array_ptr<WSLCContainerPortMapping> ports;
-                VERIFY_SUCCEEDED(session.ListContainers(&containers, containers.size_address<ULONG>(), &ports, ports.size_address<ULONG>()));
+                VERIFY_SUCCEEDED(session.ListContainers(
+                    nullptr, &containers, containers.size_address<ULONG>(), &ports, ports.size_address<ULONG>()));
 
                 std::string stoppedId = container.Id();
                 for (const auto& port : ports)
@@ -6975,12 +7490,12 @@ class WSLCTests
             std::vector<std::string> lines;
             auto onData = [&](const gsl::span<char>& data) { lines.emplace_back(data.data(), data.size()); };
 
-            wsl::windows::common::relay::MultiHandleWait io;
+            wsl::windows::common::io::MultiHandleWait io;
 
-            io.AddHandle(std::make_unique<wsl::windows::common::relay::LineBasedReadHandle>(std::move(readPipe), std::move(onData), Crlf));
+            io.AddHandle(std::make_unique<wsl::windows::common::io::LineBasedReadHandle>(std::move(readPipe), std::move(onData), Crlf));
 
             std::vector<char> buffer{Data.begin(), Data.end()};
-            io.AddHandle(std::make_unique<wsl::windows::common::relay::WriteHandle>(std::move(writePipe), buffer));
+            io.AddHandle(std::make_unique<wsl::windows::common::io::WriteHandle>(std::move(writePipe), buffer));
 
             io.Run({});
 
@@ -7039,12 +7554,12 @@ class WSLCTests
             std::vector<std::string> chunks;
             auto onData = [&](const gsl::span<char>& data) { chunks.emplace_back(data.data(), data.size()); };
 
-            wsl::windows::common::relay::MultiHandleWait io;
+            wsl::windows::common::io::MultiHandleWait io;
 
-            io.AddHandle(std::make_unique<wsl::windows::common::relay::HTTPChunkBasedReadHandle>(std::move(readPipe), std::move(onData)));
+            io.AddHandle(std::make_unique<wsl::windows::common::io::HTTPChunkBasedReadHandle>(std::move(readPipe), std::move(onData)));
 
             std::vector<char> buffer{Data.begin(), Data.end()};
-            io.AddHandle(std::make_unique<wsl::windows::common::relay::WriteHandle>(std::move(writePipe), buffer));
+            io.AddHandle(std::make_unique<wsl::windows::common::io::WriteHandle>(std::move(writePipe), buffer));
 
             io.Run({});
 
@@ -7107,8 +7622,8 @@ class WSLCTests
             std::vector<std::string> chunks;
             auto onData = [&](const gsl::span<char>& data) { chunks.emplace_back(data.data(), data.size()); };
 
-            auto reader = std::make_unique<wsl::windows::common::relay::HTTPChunkBasedReadHandle>(
-                wsl::windows::common::relay::HandleWrapper{nullptr}, std::move(onData));
+            auto reader = std::make_unique<wsl::windows::common::io::HTTPChunkBasedReadHandle>(
+                wsl::windows::common::io::HandleWrapper{nullptr}, std::move(onData));
 
             std::string allData;
             for (const auto& datum : Data)
@@ -7178,9 +7693,9 @@ class WSLCTests
             auto [readPipe, writePipe] = wsl::windows::common::wslutil::OpenAnonymousPipe(16 * 1024, true, false);
 
             std::string readData;
-            wsl::windows::common::relay::MultiHandleWait io;
+            wsl::windows::common::io::MultiHandleWait io;
 
-            io.AddHandle(std::make_unique<wsl::windows::common::relay::ReadHandle>(std::move(readPipe), [&](const gsl::span<char>& buffer) {
+            io.AddHandle(std::make_unique<wsl::windows::common::io::ReadHandle>(std::move(readPipe), [&](const gsl::span<char>& buffer) {
                 if (!buffer.empty())
                 {
                     readData.append(buffer.data(), buffer.size());
@@ -7212,7 +7727,7 @@ class WSLCTests
                 std::filesystem::remove("write-handle-test");
             });
 
-            wsl::windows::common::relay::MultiHandleWait io;
+            wsl::windows::common::io::MultiHandleWait io;
             io.AddHandle(std::make_unique<WriteHandle>(outputFile.get(), writeBuffer));
             io.Run({});
 
@@ -7232,7 +7747,7 @@ class WSLCTests
 
     TEST_METHOD(DockerIORelay)
     {
-        using namespace wsl::windows::common::relay;
+        using namespace wsl::windows::common::io;
 
         auto runTest = [](const std::vector<char>& Input, const std::string& ExpectedStdout, const std::string& ExpectedStderr) {
             auto [readPipe, writePipe] = wsl::windows::common::wslutil::OpenAnonymousPipe(16 * 1024, true, false);
@@ -7334,9 +7849,7 @@ class WSLCTests
             VERIFY_ARE_EQUAL(container.State(), WslcContainerStateExited);
 
             // Capture StateChangedAt and CreatedAt before the session is destroyed.
-            wil::unique_cotaskmem_array_ptr<WSLCContainerEntry> containers;
-            wil::unique_cotaskmem_array_ptr<WSLCContainerPortMapping> ports;
-            VERIFY_SUCCEEDED(session->ListContainers(&containers, containers.size_address<ULONG>(), &ports, ports.size_address<ULONG>()));
+            auto [containers, ports] = ListContainers(session.get());
             VERIFY_ARE_EQUAL(containers.size(), 1);
             originalStateChangedAt = containers[0].StateChangedAt;
             originalCreatedAt = containers[0].CreatedAt;
@@ -7352,9 +7865,7 @@ class WSLCTests
             VERIFY_ARE_EQUAL(container.State(), WslcContainerStateExited);
 
             // Verify that StateChangedAt was correctly restored from the Docker timestamp.
-            wil::unique_cotaskmem_array_ptr<WSLCContainerEntry> containers;
-            wil::unique_cotaskmem_array_ptr<WSLCContainerPortMapping> ports;
-            VERIFY_SUCCEEDED(session->ListContainers(&containers, containers.size_address<ULONG>(), &ports, ports.size_address<ULONG>()));
+            auto [containers, ports] = ListContainers(session.get());
             VERIFY_ARE_EQUAL(containers.size(), 1);
 
             // StateChangedAt may differ by ~1s between live (event time) and recovery (FinishedAt).
@@ -8083,6 +8594,122 @@ class WSLCTests
         }
     }
 
+    WSLC_TEST_METHOD(ContainerStats_RunningContainer)
+    {
+        // Start a long-lived detached container on a bridged network so network stats are populated.
+        WSLCContainerLauncher launcher("debian:latest", "wslc-test-stats", {"sleep", "60"}, {}, WSLCContainerNetworkTypeBridged);
+
+        auto runningContainer = launcher.Launch(*m_defaultSession, WSLCContainerStartFlagsNone);
+
+        wil::com_ptr<IWSLCContainer> container;
+        VERIFY_SUCCEEDED(m_defaultSession->OpenContainer("wslc-test-stats", &container));
+
+        wil::unique_cotaskmem_ansistring output;
+        VERIFY_SUCCEEDED(container->Stats(&output));
+        VERIFY_IS_NOT_NULL(output.get());
+        VERIFY_IS_FALSE(std::string(output.get()).empty());
+
+        const auto stats = wsl::shared::FromJson<wsl::windows::common::docker_schema::ContainerStats>(output.get());
+
+        // cpu_stats
+        // The VM has been running so system_cpu_usage is non-zero.
+        VERIFY_IS_GREATER_THAN(stats.cpu_stats.system_cpu_usage, 0ull);
+
+        // The container process itself has consumed some CPU.
+        VERIFY_IS_GREATER_THAN(stats.cpu_stats.cpu_usage.total_usage, 0ull);
+
+        // Kernel + user time together must not exceed total CPU time.
+        VERIFY_IS_LESS_THAN_OR_EQUAL(
+            stats.cpu_stats.cpu_usage.usage_in_kernelmode + stats.cpu_stats.cpu_usage.usage_in_usermode, stats.cpu_stats.cpu_usage.total_usage);
+
+        // The session was created with 4 CPUs.
+        VERIFY_IS_GREATER_THAN(stats.cpu_stats.online_cpus, 0u);
+
+        // precpu_stats
+        // precpu_stats is a prior snapshot; its total must not exceed the current total.
+        VERIFY_IS_LESS_THAN_OR_EQUAL(stats.precpu_stats.cpu_usage.total_usage, stats.cpu_stats.cpu_usage.total_usage);
+        VERIFY_IS_LESS_THAN_OR_EQUAL(stats.precpu_stats.system_cpu_usage, stats.cpu_stats.system_cpu_usage);
+
+        // memory_stats
+        // Limit is the VM memory ceiling — must be non-zero.
+        VERIFY_IS_GREATER_THAN(stats.memory_stats.limit, 0ull);
+
+        // The sleep process occupies at least some memory.
+        VERIFY_IS_GREATER_THAN(stats.memory_stats.usage, 0ull);
+
+        // Usage must never exceed the reported limit.
+        VERIFY_IS_LESS_THAN_OR_EQUAL(stats.memory_stats.usage, stats.memory_stats.limit);
+
+        // pids_stats
+        // At minimum the sleep process itself must be counted.
+        VERIFY_IS_GREATER_THAN(stats.pids_stats.current, 0ull);
+
+        // networks
+        // A bridged container always has at least one network interface.
+        VERIFY_IS_TRUE(stats.networks.has_value());
+        VERIFY_IS_FALSE(stats.networks->empty());
+
+        // Every interface entry must have consistent packet/byte counts
+        // (bytes >= 0 is trivially true for unsigned, but packets imply bytes >= 0 too).
+        for (const auto& [iface, net] : *stats.networks)
+        {
+            VERIFY_IS_FALSE(iface.empty());
+
+            // If packets were received/sent, the byte count must also be non-zero.
+            if (net.rx_packets > 0)
+            {
+                VERIFY_IS_GREATER_THAN(net.rx_bytes, 0ull);
+            }
+            if (net.tx_packets > 0)
+            {
+                VERIFY_IS_GREATER_THAN(net.tx_bytes, 0ull);
+            }
+        }
+
+        // blkio_stats
+        // io_service_bytes_recursive may be absent for a container with no disk I/O,
+        // but if present every entry must have a non-empty operation name.
+        if (stats.blkio_stats.io_service_bytes_recursive.has_value())
+        {
+            for (const auto& entry : *stats.blkio_stats.io_service_bytes_recursive)
+            {
+                VERIFY_IS_FALSE(entry.op.empty());
+            }
+        }
+    }
+
+    WSLC_TEST_METHOD(ContainerStats_NullOutputPointer)
+    {
+        WSLCContainerLauncher launcher("debian:latest", "wslc-test-stats-null", {"sleep", "60"}, {}, WSLCContainerNetworkTypeBridged);
+        auto runningContainer = launcher.Launch(*m_defaultSession, WSLCContainerStartFlagsNone);
+
+        wil::com_ptr<IWSLCContainer> container;
+        VERIFY_SUCCEEDED(m_defaultSession->OpenContainer("wslc-test-stats-null", &container));
+
+        // Passing nullptr for Output must fail.
+        VERIFY_FAILED(container->Stats(nullptr));
+    }
+
+    WSLC_TEST_METHOD(ContainerStats_CreatedContainer_ReturnsZeroedStats)
+    {
+        // A created-but-not-started container returns zeroed stats from Docker rather than an error.
+        WSLCContainerLauncher launcher("debian:latest", "wslc-test-stats-created", {}, {}, WSLCContainerNetworkTypeBridged);
+        auto [result, runningContainer] = launcher.CreateNoThrow(*m_defaultSession);
+        VERIFY_SUCCEEDED(result);
+
+        wil::com_ptr<IWSLCContainer> container;
+        VERIFY_SUCCEEDED(m_defaultSession->OpenContainer("wslc-test-stats-created", &container));
+        auto cleanup = wil::scope_exit([&]() { LOG_IF_FAILED(container->Delete(WSLCDeleteFlagsForce)); });
+
+        wil::unique_cotaskmem_ansistring output;
+        VERIFY_SUCCEEDED(container->Stats(&output));
+        VERIFY_IS_NOT_NULL(output.get());
+
+        // A non-running container has no active processes.
+        auto stats = wsl::shared::FromJson<wsl::windows::common::docker_schema::ContainerStats>(output.get());
+        VERIFY_ARE_EQUAL(0ull, stats.pids_stats.current);
+    }
+
     WSLC_TEST_METHOD(InvalidNames)
     {
         auto expectInvalidArg = [&](const std::string& name) {
@@ -8249,8 +8876,8 @@ class WSLCTests
 
             wil::unique_cotaskmem_array_ptr<WSLCContainerEntry> containers;
             wil::unique_cotaskmem_array_ptr<WSLCContainerPortMapping> ports;
-            VERIFY_SUCCEEDED(
-                m_defaultSession->ListContainers(&containers, containers.size_address<ULONG>(), &ports, ports.size_address<ULONG>()));
+            VERIFY_SUCCEEDED(m_defaultSession->ListContainers(
+                nullptr, &containers, containers.size_address<ULONG>(), &ports, ports.size_address<ULONG>()));
             VERIFY_ARE_EQUAL(containers.size(), 0);
         }
     }
@@ -8284,14 +8911,15 @@ class WSLCTests
 
         wil::unique_cotaskmem_array_ptr<WSLCContainerEntry> containers;
         wil::unique_cotaskmem_array_ptr<WSLCContainerPortMapping> ports;
-        VERIFY_SUCCEEDED(m_defaultSession->ListContainers(&containers, containers.size_address<ULONG>(), &ports, ports.size_address<ULONG>()));
+        VERIFY_SUCCEEDED(m_defaultSession->ListContainers(
+            nullptr, &containers, containers.size_address<ULONG>(), &ports, ports.size_address<ULONG>()));
         VERIFY_ARE_EQUAL(containers.size(), 0);
     }
 
     WSLC_TEST_METHOD(ContainerNameGeneration)
     {
         {
-            // Create a container with a specific name
+            // Create a container with a specific name.
             auto container = WSLCContainerLauncher("debian:latest", "test-container-name").Create(*m_defaultSession.get());
 
             // Validate that the container name is correct.
@@ -8302,8 +8930,38 @@ class WSLCTests
             // Create a container without name.
             auto container = WSLCContainerLauncher("debian:latest").Create(*m_defaultSession.get());
 
-            // Validate that the service generates a name for the container.
-            VERIFY_ARE_NOT_EQUAL(container.Name(), "");
+            // Validate that the service generates a name in the format "descriptor_mountain[digit]".
+            auto name = container.Name();
+            VERIFY_ARE_NOT_EQUAL(name, "");
+
+            auto underscore = name.find('_');
+            VERIFY_ARE_NOT_EQUAL(underscore, std::string::npos);
+
+            auto descriptor = name.substr(0, underscore);
+            auto mountain = name.substr(underscore + 1);
+
+            // Strip trailing retry digit if present.
+            if (!mountain.empty() && std::isdigit(mountain.back()))
+            {
+                mountain.pop_back();
+            }
+
+            using wsl::windows::service::wslc::c_descriptors;
+            using wsl::windows::service::wslc::c_mountains;
+
+            VERIFY_IS_TRUE(std::ranges::find(c_descriptors, descriptor) != c_descriptors.end());
+            VERIFY_IS_TRUE(std::ranges::find(c_mountains, mountain) != c_mountains.end());
+        }
+
+        {
+            // Create multiple containers without names and verify they get unique names.
+            auto container1 = WSLCContainerLauncher("debian:latest").Create(*m_defaultSession.get());
+            auto container2 = WSLCContainerLauncher("debian:latest").Create(*m_defaultSession.get());
+            auto container3 = WSLCContainerLauncher("debian:latest").Create(*m_defaultSession.get());
+
+            VERIFY_ARE_NOT_EQUAL(container1.Name(), container2.Name());
+            VERIFY_ARE_NOT_EQUAL(container1.Name(), container3.Name());
+            VERIFY_ARE_NOT_EQUAL(container2.Name(), container3.Name());
         }
     }
 
@@ -8385,8 +9043,8 @@ class WSLCTests
         {
             wil::unique_cotaskmem_array_ptr<WSLCContainerEntry> containers;
             wil::unique_cotaskmem_array_ptr<WSLCContainerPortMapping> ports;
-            VERIFY_SUCCEEDED(
-                m_defaultSession->ListContainers(&containers, containers.size_address<ULONG>(), &ports, ports.size_address<ULONG>()));
+            VERIFY_SUCCEEDED(m_defaultSession->ListContainers(
+                nullptr, &containers, containers.size_address<ULONG>(), &ports, ports.size_address<ULONG>()));
 
             if (containers.size() > 0)
             {
@@ -8486,7 +9144,7 @@ class WSLCTests
 
         auto cleanup = wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [&]() {
             PruneResult result;
-            LOG_IF_FAILED(m_defaultSession->PruneContainers(nullptr, 0, 0, &result.result));
+            LOG_IF_FAILED(m_defaultSession->PruneContainers(nullptr, 0, &result.result));
         });
 
         // Use overlapped write pipe so the server-side WriteFile doesn't block synchronously.
@@ -8510,8 +9168,8 @@ class WSLCTests
             std::string output;
             auto onRead = [&](const gsl::span<char>& data) { output.append(data.data(), data.size()); };
 
-            wsl::windows::common::relay::MultiHandleWait io;
-            io.AddHandle(std::make_unique<wsl::windows::common::relay::ReadHandle>(TtyOut, std::move(onRead)));
+            wsl::windows::common::io::MultiHandleWait io;
+            io.AddHandle(std::make_unique<wsl::windows::common::io::ReadHandle>(TtyOut, std::move(onRead)));
 
             io.Run(60s);
 
@@ -8603,19 +9261,19 @@ class WSLCTests
     {
         auto expectPrune = [this](
                                const std::vector<std::string>& expectedIds = {},
-                               const std::map<std::string, std::pair<const char*, bool>>& labels = {},
-                               uint64_t until = 0,
+                               const std::vector<std::pair<std::string, std::string>>& filterPairs = {},
                                const std::source_location& source = std::source_location::current()) {
             PruneResult result;
 
-            std::vector<WSLCPruneLabelFilter> labelsFilter;
-            for (const auto& e : labels)
+            std::vector<WSLCFilter> filters;
+            filters.reserve(filterPairs.size());
+            for (const auto& [key, value] : filterPairs)
             {
-                labelsFilter.push_back({e.first.c_str(), e.second.first, e.second.second});
+                filters.push_back({key.c_str(), value.c_str()});
             }
 
             VERIFY_SUCCEEDED(m_defaultSession->PruneContainers(
-                labels.empty() ? nullptr : labelsFilter.data(), static_cast<DWORD>(labelsFilter.size()), until, &result.result));
+                filters.empty() ? nullptr : filters.data(), static_cast<ULONG>(filters.size()), &result.result));
 
             std::vector<std::string> prunedContainers;
             for (size_t i = 0; i < result.result.ContainersCount; i++)
@@ -8679,16 +9337,16 @@ class WSLCTests
             auto testPrune4 = RunAndWait(testPrune4Launcher);
 
             // Expect testPrune1 to be selected via key=value.
-            expectPrune({testPrune1.Id()}, {{"key", {"value", true}}});
+            expectPrune({testPrune1.Id()}, {{"label", "key=value"}});
 
             // Expect testPrune2 to be selected via key being present.
-            expectPrune({testPrune2.Id()}, {{"key", {nullptr, true}}});
+            expectPrune({testPrune2.Id()}, {{"label", "key"}});
 
             // Prune by absence of 'anotherKey' label.
-            expectPrune({testPrune4.Id()}, {{"anotherKey", {nullptr, false}}});
+            expectPrune({testPrune4.Id()}, {{"label!", "anotherKey"}});
 
             // Prune by label inequality.
-            expectPrune({testPrune3.Id()}, {{"anotherKey", {"someValue", false}}});
+            expectPrune({testPrune3.Id()}, {{"label!", "anotherKey=someValue"}});
         }
 
         // Validate that the 'until' filter works.
@@ -8699,17 +9357,17 @@ class WSLCTests
 
             auto now = time(nullptr);
 
-            expectPrune({}, {}, now - 3600);
-            expectPrune({container.Id()}, {}, now + 3600);
+            expectPrune({}, {{"until", std::to_string(now - 3600)}});
+            expectPrune({container.Id()}, {{"until", std::to_string(now + 3600)}});
         }
 
         // Validate error paths.
         {
-            WSLCPruneLabelFilter filter{.Key = nullptr, .Value = nullptr, .Present = false};
+            WSLCFilter filter{.Key = nullptr, .Value = nullptr};
             PruneResult result;
 
-            VERIFY_ARE_EQUAL(m_defaultSession->PruneContainers(&filter, 1, 0, &result.result), E_POINTER);
-            VERIFY_ARE_EQUAL(m_defaultSession->PruneContainers(&filter, 1, 0, nullptr), HRESULT_FROM_WIN32(RPC_X_NULL_REF_POINTER));
+            VERIFY_ARE_EQUAL(m_defaultSession->PruneContainers(&filter, 1, &result.result), E_POINTER);
+            VERIFY_ARE_EQUAL(m_defaultSession->PruneContainers(&filter, 1, nullptr), HRESULT_FROM_WIN32(RPC_X_NULL_REF_POINTER));
         }
     }
 

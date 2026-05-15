@@ -25,22 +25,23 @@ COMMAND_LINE_TEST_CASE(L"-?", L"root", true)
 COMMAND_LINE_TEST_CASE(L"--version", L"root", true)
 COMMAND_LINE_TEST_CASE(L"-v", L"root", true)
 
-// Session command tests
-COMMAND_LINE_TEST_CASE(L"session list", L"list", true)
-COMMAND_LINE_TEST_CASE(L"session list --verbose", L"list", true)
-COMMAND_LINE_TEST_CASE(L"session list --verbose --help", L"list", true)
-COMMAND_LINE_TEST_CASE(L"session list --notanarg", L"list", false)
-COMMAND_LINE_TEST_CASE(L"session list extraarg", L"list", false)
-COMMAND_LINE_TEST_CASE(L"session shell session1", L"shell", true)
-COMMAND_LINE_TEST_CASE(L"session shell", L"shell", true)
-COMMAND_LINE_TEST_CASE(L"session terminate session1", L"terminate", true)
-COMMAND_LINE_TEST_CASE(L"session terminate", L"terminate", true)
-COMMAND_LINE_TEST_CASE(L"session enter C:\\storage", L"enter", true)
-COMMAND_LINE_TEST_CASE(L"session enter C:\\storage --name my-session", L"enter", true)
-COMMAND_LINE_TEST_CASE(L"session enter --name my-session C:\\storage", L"enter", true)
-COMMAND_LINE_TEST_CASE(L"session enter", L"enter", false)                        // Missing required storage-path
-COMMAND_LINE_TEST_CASE(L"session enter C:\\storage --notanarg", L"enter", false) // Invalid argument
-COMMAND_LINE_TEST_CASE(L"session enter --name my-session", L"enter", false)      // Missing required positional before flag
+// System command tests
+COMMAND_LINE_TEST_CASE(L"system -?", L"system", true)
+COMMAND_LINE_TEST_CASE(L"system session list", L"list", true)
+COMMAND_LINE_TEST_CASE(L"system session list --verbose", L"list", true)
+COMMAND_LINE_TEST_CASE(L"system session list --verbose --help", L"list", true)
+COMMAND_LINE_TEST_CASE(L"system session list --notanarg", L"list", false)
+COMMAND_LINE_TEST_CASE(L"system session list extraarg", L"list", false)
+COMMAND_LINE_TEST_CASE(L"system session shell session1", L"shell", true)
+COMMAND_LINE_TEST_CASE(L"system session shell", L"shell", true)
+COMMAND_LINE_TEST_CASE(L"system session terminate session1", L"terminate", true)
+COMMAND_LINE_TEST_CASE(L"system session terminate", L"terminate", true)
+COMMAND_LINE_TEST_CASE(L"system session enter C:\\storage", L"enter", true)
+COMMAND_LINE_TEST_CASE(L"system session enter C:\\storage --name my-session", L"enter", true)
+COMMAND_LINE_TEST_CASE(L"system session enter --name my-session C:\\storage", L"enter", true)
+COMMAND_LINE_TEST_CASE(L"system session enter", L"enter", false)                        // Missing required storage-path
+COMMAND_LINE_TEST_CASE(L"system session enter C:\\storage --notanarg", L"enter", false) // Invalid argument
+COMMAND_LINE_TEST_CASE(L"system session enter --name my-session", L"enter", false)      // Missing required positional before flag
 
 // Container command tests
 COMMAND_LINE_TEST_CASE(L"container list", L"list", true)
@@ -146,6 +147,13 @@ COMMAND_LINE_TEST_CASE(L"rm cont1", L"remove", true)
 COMMAND_LINE_TEST_CASE(L"container rm cont1 cont2", L"remove", true)
 COMMAND_LINE_TEST_CASE(L"container attach cont", L"attach", true)
 COMMAND_LINE_TEST_CASE(L"container attach", L"attach", false)
+// Stats command tests
+COMMAND_LINE_TEST_CASE(L"stats", L"stats", true)
+COMMAND_LINE_TEST_CASE(L"container stats", L"stats", true)
+COMMAND_LINE_TEST_CASE(L"container stats cont1", L"stats", true)
+COMMAND_LINE_TEST_CASE(L"container stats cont1 cont2", L"stats", true)
+COMMAND_LINE_TEST_CASE(L"container stats --no-trunc cont1", L"stats", true)
+COMMAND_LINE_TEST_CASE(L"container stats --all", L"stats", true)
 
 // Logs command
 COMMAND_LINE_TEST_CASE(L"logs cont1", L"logs", true)
