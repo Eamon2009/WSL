@@ -456,12 +456,6 @@ void wsl::core::Config::Initialize(_In_opt_ HANDLE UserToken)
         VALIDATE_CONFIG_OPTION(!EnableVirtio, EnableVirtioFs, false);
     }
 
-    if (EnableVirtio9p)
-    {
-        EMIT_USER_WARNING(wsl::shared::Localization::MessageConfigVirtio9pDisabled());
-        EnableVirtio9p = false;
-    }
-
     if (NetworkingMode != NetworkingMode::Nat && NetworkingMode != NetworkingMode::Mirrored && NetworkingMode != NetworkingMode::VirtioProxy)
     {
         VALIDATE_CONFIG_OPTION(

@@ -1123,9 +1123,6 @@ Attempting web download...</value>
   <data name="MessageNoInstallDefault" xml:space="preserve">
     <value>No default distribution has been configured. Please provide a distribution to install.</value>
   </data>
-  <data name="MessageConfigVirtio9pDisabled" xml:space="preserve">
-    <value>wsl2.virtio9p is disabled, falling back to 9p with vsock transport.</value>
-  </data>
   <data name="MessageInstallationCorrupted" xml:space="preserve">
     <value>WSL installation appears to be corrupted (Error code: {}).
 Press any key to repair WSL, or CTRL-C to cancel.
