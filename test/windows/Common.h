@@ -521,6 +521,7 @@ struct TestConfigDefaults
     std::optional<bool> safeMode;
     std::optional<bool> guiApplications;
     std::optional<DrvFsMode> drvFsMode;
+    std::optional<bool> drvFsTransports;
     std::optional<wsl::core::NetworkingMode> networkingMode;
     const std::optional<std::wstring> vmSwitch;
     const std::optional<std::wstring> macAddress;
